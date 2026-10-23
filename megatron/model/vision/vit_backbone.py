@@ -214,14 +214,30 @@ class VitBackbone(MegatronModule):
                     if d_model % 2 != 0:
                         raise ValueError("Cannot use sin/cos positional encoding with "
                                         "odd dim (got dim={:d})".format(d_model))
-                    dtype = torch.float16
-                    pe = torch.zeros((length, d_model), dtype=dtype, device=dev)
-                    position = torch.arange(0, length, dtype=dtype, device=dev).unsqueeze(1)
-                    div_term = torch.exp((torch.arange(0, d_model, 2, dtype=dtype, device=dev) *
+                    # Build the table in fp32 and cast once at the end.
+                    #
+                    # The position index must be fp32. fp16 spaces consecutive
+                    # integers exactly only to 2048 and has no finite value
+                    # above 65504, so in fp16 this benchmark's sequences either
+                    # collapse many tokens onto one position (81% of adjacent
+                    # pairs at 32K tokens) or overflow to inf and make the whole
+                    # table NaN (every point at 262K and above). bf16 is worse
+                    # still: 8 mantissa bits leave 4% of 32K positions distinct.
+                    #
+                    # div_term must also be fp32: exp(-9.2*i/d) underflows fp16
+                    # subnormals in the high-frequency channels.
+                    pe = torch.zeros((length, d_model), dtype=torch.float32, device=dev)
+                    position = torch.arange(0, length, dtype=torch.float32, device=dev).unsqueeze(1)
+                    div_term = torch.exp((torch.arange(0, d_model, 2, dtype=torch.float32, device=dev) *
                                         -(math.log(10000.0) / d_model)))
-                    pe[:, 0::2] = torch.sin(position.float() * div_term)
-                    pe[:, 1::2] = torch.cos(position.float() * div_term)
-                    return pe
+                    pe[:, 0::2] = torch.sin(position * div_term)
+                    pe[:, 1::2] = torch.cos(position * div_term)
+                    # sin/cos outputs live in [-1, 1], which both fp16 and bf16
+                    # represent fine; match the model dtype so the later
+                    # `concatenated_tokens + self.position_embeddings` does not
+                    # silently promote activations to fp32 (bf16 + fp16 -> fp32,
+                    # which is what made --bf16 crash in LayerNorm).
+                    return pe.to(args.params_dtype)
 
                 pos_encoding = positionalencoding1d(self.hidden_size, self.seq_length, dist.get_local_rank())
 
