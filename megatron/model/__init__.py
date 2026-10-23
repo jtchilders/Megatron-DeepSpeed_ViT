@@ -4,7 +4,15 @@ import torch
 from deepspeed.accelerator.real_accelerator import get_accelerator
 
 if get_accelerator().device_name() == 'xpu':
-    import intel_extension_for_pytorch
+    # IPEX was a mandatory separate package on older Aurora stacks. On the
+    # current frameworks module its XPU support is upstreamed into torch
+    # (torch.xpu), and the package is no longer installed, so importing it
+    # is best-effort. The IPEX-only ops this file reaches for are probed
+    # through torch.xpu below.
+    try:
+        import intel_extension_for_pytorch
+    except ImportError:
+        pass
 if get_accelerator().device_name() == 'cuda':
     from .fused_layer_norm import MixedFusedLayerNorm as LayerNorm
     from apex.normalization import MixedFusedRMSNorm as RMSNorm

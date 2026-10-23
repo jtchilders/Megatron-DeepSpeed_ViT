@@ -1368,8 +1368,14 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     ## Checkout Model parameters
     args = get_args()
     if args.rank == 0:
-        from torchinfo import summary
-        summary(model[0])
+        # torchinfo only prints a parameter-count table; it is not part of the
+        # benchmark. It is absent from the Aurora frameworks module, so do not
+        # let a missing diagnostic dependency stop the training loop.
+        try:
+            from torchinfo import summary
+            summary(model[0])
+        except ImportError:
+            print_rank_0('torchinfo not installed; skipping model summary')
 
     while iteration < args.train_iters and (args.train_tokens is None or \
         args.consumed_train_tokens < args.train_tokens):
