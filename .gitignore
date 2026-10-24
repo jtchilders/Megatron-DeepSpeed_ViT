@@ -44,3 +44,5 @@ megatron/varuni_vit_utils.py
 # log files
 mds_qsub.sh.*
 FlyKD.*
+# Core dumps from crashed ranks. These are ~59 GB each on Aurora.
+core.*

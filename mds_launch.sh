@@ -30,6 +30,8 @@ setup_aurora_env_and_vars() {
     ## TODO: if hang is observed with num_node=1, conditionally remove cxi
     module restore
     module load frameworks
+    ## An ensemble member sets PBS_NODEFILE to its own slice of the
+    ## allocation, so this stays correct when several runs share a job.
     NHOSTS=$(wc -l < "${PBS_NODEFILE}")
     WANDB_PROJECT_NAME="AuroraViT"
     FA_VERSION="--use-flash-attn-builder"
@@ -252,7 +254,10 @@ setup_megatron_deepspeed_args() {
     if [[ $MICS_SHARD_SIZE -gt 1 ]]; then
         MICS="_MICS"
     fi
-    DS_CONFIG_FNAME="TOY_N${NHOSTS}${MICS}.json"
+    ## DS_TAG lets several runs share one PBS allocation (see
+    ## ViT/submit_ensemble_aurora.sh): without it, two concurrent members
+    ## with the same node count would write and read the same config file.
+    DS_CONFIG_FNAME="TOY_N${NHOSTS}${MICS}${DS_TAG:+_${DS_TAG}}.json"
 
     if [[ $NUM_ITERS ]]; then
         TRAIN_SAMPLES=$(($NUM_ITERS * $GBS))
@@ -490,9 +495,16 @@ setup_model_hyperparameter
 setup_megatron_deepspeed_args
 
 # 4. Launch run_cmd
-export MASTER_ADDR=$(hostname)
-export MASTER_PORT=$((RANDOM + 1024))
+## MASTER_ADDR must be this member's own first node, not whichever node the
+## shell happens to run on: in an ensemble every member shares that shell.
+## MASTER_PORT likewise has to be distinct per member, so allow an override
+## instead of drawing at random and hoping (see submit_ensemble_aurora.sh).
+export MASTER_ADDR="${MASTER_ADDR:-$(head -n 1 "${PBS_NODEFILE}")}"
+export MASTER_PORT="${MASTER_PORT:-$((RANDOM + 1024))}"
+## --hostfile confines a member to its own slice; without it every member
+## would spread across the whole allocation and oversubscribe the nodes.
 run_cmd="mpiexec --verbose --envall -n ${NGPUS} -ppn ${NGPU_PER_HOST} \
+    --hostfile ${PBS_NODEFILE} \
     --cpu-bind $CPU_BIND \
     python3 ${PBS_O_WORKDIR}/pretrain_vision_classify.py \
     ${CLASSIFIER_ARGS} \
