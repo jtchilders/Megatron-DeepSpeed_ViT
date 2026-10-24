@@ -99,20 +99,30 @@ def get_batch(data_iterator):
         # img_dtype = torch.float16
         label_dtype = torch.int64
 
-        if dp_src_rank == 0: ## only need data in first dp group as it will get broadcasted to other dp group. 
-            ## Generate TOY DATASET on rank0
+        if dp_src_rank == 0: ## only need data in first dp group as it will get broadcasted to other dp group.
+            ## Generate this rank's own micro-batch of TOY data.
+            ##
+            ## This used to allocate the entire global batch and then slice out
+            ## [MBS*dp_rank : MBS*(dp_rank+1)]. GBS = MBS * DP grows with the
+            ## job, so the discarded remainder grew with it: at 32 nodes the
+            ## 1.73M-token point asked for 211 GiB on one 64 GiB tile, and the
+            ## 1->2048 weak-scaling series was unrunnable past about 4 nodes.
+            ##
+            ## The data is torch.randn, so a local draw is the same toy
+            ## distribution -- there is nothing to keep consistent across DP
+            ## ranks, which is precisely why they were handed disjoint slices.
+            ## Ranks that shard one sample (SP/TP) still agree with each other,
+            ## because broadcast_data below sends this tensor to the whole
+            ## model-parallel group.
+            num_classes = int(os.environ["NUM_CLASSES"])
             if "VIT3D" not in os.environ:
-                full_img = torch.randn(b, c, h, w, dtype=img_dtype, device=dev) ## B, S
+                img = torch.randn(MBS, c, h, w, dtype=img_dtype, device=dev) ## B, S
             else:
                 d = int(os.environ["IMG_D"])
-                full_img = torch.randn(b, c, h, w, d, dtype=img_dtype, device=dev)
-            num_classes = int(os.environ["NUM_CLASSES"])
-            full_label = torch.randint(num_classes, (b,), dtype=label_dtype, device=dev) ## B, S
+                img = torch.randn(MBS, c, h, w, d, dtype=img_dtype, device=dev)
+            label = torch.randint(num_classes, (MBS,), dtype=label_dtype, device=dev) ## B, S
 
-            ## Partition data to replicate DP mechanism. 
-            strt_idx = MBS * dp_rank
-            end_idx = strt_idx + MBS
-            data_dict = {'image': full_img[strt_idx: end_idx], 'label': full_label[strt_idx: end_idx]}
+            data_dict = {'image': img, 'label': label}
         else:
             data_dict = None
     else:

@@ -130,11 +130,26 @@ setup_model_hyperparameter() {
         FFN_HSIZE=4096
         NUM_HEADS=16
     elif [[ $VIT == "315M" ]]; then
-        ## Aurora friendly (head count is dividsible by 12)
+        ## Aurora friendly (head count is divisible by 12 and by 24)
+        ##
+        ## 24, not 12, because Ulysses shards attention heads across the
+        ## sequence-parallel group and vit_backbone.py asserts
+        ## num_attention_heads % sp == 0. The ALCF-4 sweep's longest point
+        ## (1.73M tokens) runs at SP=24 -- two Aurora nodes -- which 12 heads
+        ## cannot satisfy, so that point failed at model construction on any
+        ## node count.
+        ##
+        ## This does not change the model's size or its measured work. The
+        ## QKV/output projections are hidden x hidden and the MLP is
+        ## hidden x ffn_hidden; head count appears in neither, so 12 -> 24
+        ## reshapes the same 308,281,344 parameters (head_dim 128 -> 64, the
+        ## more conventional value). num_floating_point_operations() in
+        ## megatron/training.py likewise takes no head term, so the FOM is
+        ## unchanged. Vendors must use 24 to reproduce these numbers.
         NLAYERS=14
         HSIZE=1536
         FFN_HSIZE=4096
-        NUM_HEADS=12
+        NUM_HEADS=24
     elif [[ $VIT == "HUGE" ]]; then
         ## VIT-HUGE (632M)
         NLAYERS=32
