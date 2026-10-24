@@ -322,6 +322,7 @@ class VitBackbone(MegatronModule):
 
     def forward(self, input):
         if self.pre_process:
+            pre_sharded = False  # set by the 3D path when it slabs the volume
             if "VIT3D" not in os.environ:
                 rearranged_input = einops.rearrange(
                     input,
@@ -330,6 +331,29 @@ class VitBackbone(MegatronModule):
                     p2=self.patch_dim,
                 )
             else:
+                ## Cut this rank's voxel slab out BEFORE patchifying, not
+                ## after. einops.rearrange materializes a whole second copy of
+                ## the volume, of which a sequence-parallel rank keeps 1/SP:
+                ## at the 1.73M-token point that is a 13.2 GiB temporary to
+                ## retain 0.55 GiB, on a 64 GiB tile that OOM'd needing
+                ## 634 MiB more.
+                ##
+                ## Tokens are ordered "b (h w d) ...", so a contiguous token
+                ## range [sub_seq_start, sub_seq_end) is a contiguous slab
+                ## along h whenever it aligns to a whole h-plane (Wp*Dp
+                ## tokens). Every point in the ALCF-4 sweep aligns, so take
+                ## the slab when it does and fall back to the original
+                ## patchify-then-slice when it does not. The result is bitwise
+                ## identical either way.
+                p = self.patch_dim
+                plane = (self.img_w // p) * (int(os.environ["IMG_D"]) // p)
+                if (self.ds_sequence_parallel
+                        and self.sub_seq_start % plane == 0
+                        and self.sub_seq_end % plane == 0):
+                    input = input[:, :,
+                                  (self.sub_seq_start // plane) * p:
+                                  (self.sub_seq_end // plane) * p, :, :]
+                    pre_sharded = True
                 rearranged_input = einops.rearrange(
                     input,
                     "b c (h p1) (w p2) (d p3) -> b (h w d) (p1 p2 p3 c)",
@@ -339,7 +363,7 @@ class VitBackbone(MegatronModule):
                 )
 
             seq_parallel_rank = mpu.get_sequence_parallel_rank()
-            if self.ds_sequence_parallel:
+            if self.ds_sequence_parallel and not pre_sharded:
                 rearranged_input = rearranged_input[:, self.sub_seq_start:self.sub_seq_end, :] ## b, s, h
 
             encoder_output = self.linear_encoder(rearranged_input)
