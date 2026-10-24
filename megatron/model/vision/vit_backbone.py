@@ -205,15 +205,28 @@ class VitBackbone(MegatronModule):
             # Embedding
             self.pos_encoding = args.pos_encoding
             if self.pos_encoding:
-                def positionalencoding1d(d_model, length, dev):
+                def positionalencoding1d(d_model, length, dev, start=0, count=None):
                     """
                     :param d_model: dimension of the model
                     :param length: length of positions
-                    :return: length*d_model position matrix
+                    :param start: first position to materialize
+                    :param count: how many positions to materialize (default: all)
+                    :return: count*d_model position matrix for positions
+                             [start, start+count)
+
+                    Only this rank's slice is built. The full table is
+                    length x d_model, which at the 1.73M-token point is 9.9 GiB
+                    in fp32 plus 4.9 GiB for the cast -- a ~15 GiB transient
+                    peak on a 64 GiB tile, to keep 0.2 GiB. Slicing afterwards
+                    does not help: a torch slice is a view onto the original
+                    storage, so the whole table would stay resident on every
+                    rank for the life of the model.
                     """
                     if d_model % 2 != 0:
                         raise ValueError("Cannot use sin/cos positional encoding with "
                                         "odd dim (got dim={:d})".format(d_model))
+                    if count is None:
+                        count = length - start
                     # Build the table in fp32 and cast once at the end.
                     #
                     # The position index must be fp32. fp16 spaces consecutive
@@ -226,8 +239,9 @@ class VitBackbone(MegatronModule):
                     #
                     # div_term must also be fp32: exp(-9.2*i/d) underflows fp16
                     # subnormals in the high-frequency channels.
-                    pe = torch.zeros((length, d_model), dtype=torch.float32, device=dev)
-                    position = torch.arange(0, length, dtype=torch.float32, device=dev).unsqueeze(1)
+                    pe = torch.zeros((count, d_model), dtype=torch.float32, device=dev)
+                    position = torch.arange(start, start + count, dtype=torch.float32,
+                                            device=dev).unsqueeze(1)
                     div_term = torch.exp((torch.arange(0, d_model, 2, dtype=torch.float32, device=dev) *
                                         -(math.log(10000.0) / d_model)))
                     pe[:, 0::2] = torch.sin(position * div_term)
@@ -239,14 +253,11 @@ class VitBackbone(MegatronModule):
                     # which is what made --bf16 crash in LayerNorm).
                     return pe.to(args.params_dtype)
 
-                pos_encoding = positionalencoding1d(self.hidden_size, self.seq_length, dist.get_local_rank())
-
             else:
                 self.position_embeddings = torch.nn.Embedding(
                     self.seq_length, self.hidden_size
                 )
 
-            ## TODO: Mem fpt: Only generate relevant sequence's positional encoding from the get go
             sp = mpu.get_sequence_parallel_world_size()
             sp_rank = mpu.get_sequence_parallel_rank()
             sub_seq_length = self.seq_length // sp
@@ -264,7 +275,16 @@ class VitBackbone(MegatronModule):
                 sub_seq_start = sum(seq_shard_list[:sp_rank])
                 sub_seq_end = sum(seq_shard_list[:sp_rank+1])
                 print("likely will use uneven sequence parallelism")
-            self.position_embeddings = pos_encoding[sub_seq_start:sub_seq_end, :] ## s, h ?
+
+            if self.pos_encoding:
+                ## Build only this rank's shard. Previously the full
+                ## seq_length x hidden table was built and then sliced, but a
+                ## torch slice is a view: the whole table stayed resident on
+                ## every rank. At 1.73M tokens that is 4.9 GiB held to use
+                ## 0.2 GiB, on top of a ~15 GiB construction peak.
+                self.position_embeddings = positionalencoding1d(
+                    self.hidden_size, self.seq_length, dist.get_local_rank(),
+                    start=sub_seq_start, count=sub_seq_end - sub_seq_start)
 
             if self.ds_sequence_parallel:
                 if class_token:
