@@ -60,6 +60,23 @@ def model_provider(pre_process=True, post_process=True):
     return model
 
 
+_TOY_STEP = 0
+
+
+def _toy_step():
+    """Monotonic counter for toy-data seeding, advanced once per batch.
+
+    Every rank in a model-parallel group calls get_batch the same number of
+    times, so this stays in lockstep across the group without communication.
+    That is what lets the ranks sharding one sample agree on its contents
+    while the contents still change from iteration to iteration.
+    """
+    global _TOY_STEP
+    step = _TOY_STEP
+    _TOY_STEP += 1
+    return step
+
+
 def get_batch(data_iterator):
     """Generate a batch.
 
@@ -142,7 +159,47 @@ def get_batch(data_iterator):
             file.write(f"label: {data_dict['label']}\n")
 
     data_i = tensor_parallel.broadcast_data(["label"], data_dict, torch.int64)
-    data_f = tensor_parallel.broadcast_data(["image"], data_dict, img_dtype)
+
+    if os.environ["DATA"] == "TOY":
+        ## Generate the image on every rank instead of broadcasting it.
+        ##
+        ## broadcast_data sends the whole volume to each member of the
+        ## model-parallel group. At the 1.73M-token point that is a 13.18 GiB
+        ## collective -- 6.6x over the 2 GiB limit that libfabric/CXI paths
+        ## commonly carry -- and at SP=24 the group spans two nodes, so it is
+        ## the first configuration where it leaves the node at all. That is
+        ## exactly where it failed:
+        ##
+        ##   factor=32  SP=1   0.25 GiB  on-node   40 iterations OK
+        ##   factor=64  SP=4   2.00 GiB  on-node   20 iterations OK
+        ##   factor=120 SP=24 13.18 GiB  OFF-NODE  dies in iteration 2 with
+        ##                                         "cxil_map: write error"
+        ##                                         then oneCCL SEND failure
+        ##
+        ## It also cost 13.18 GiB for the receive buffer plus the same again
+        ## unpacked, on every rank, every iteration.
+        ##
+        ## The data is torch.randn, so the ranks sharding one sample only have
+        ## to agree with each other. Seeding a generator identically across the
+        ## model-parallel group gives every rank the same volume the broadcast
+        ## would have delivered, with no collective at all. The seed advances
+        ## per step so the data still varies between iterations.
+        gen = torch.Generator(device=dev)
+        gen.manual_seed(1234 + _toy_step() * 1_000_003 + dp_rank)
+        c = args.num_channels
+        h = int(os.environ["IMG_W"])
+        w = int(os.environ["IMG_H"])
+        MBS = int(os.environ["MBS"])
+        if "VIT3D" not in os.environ:
+            image = torch.randn(MBS, c, h, w, dtype=img_dtype, device=dev,
+                                generator=gen)
+        else:
+            d = int(os.environ["IMG_D"])
+            image = torch.randn(MBS, c, h, w, d, dtype=img_dtype, device=dev,
+                                generator=gen)
+        data_f = {"image": image}
+    else:
+        data_f = tensor_parallel.broadcast_data(["image"], data_dict, img_dtype)
 
     labels = data_i["label"].long().contiguous()
     images = data_f["image"].contiguous()
