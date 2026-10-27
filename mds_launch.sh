@@ -132,26 +132,22 @@ setup_model_hyperparameter() {
         FFN_HSIZE=4096
         NUM_HEADS=16
     elif [[ $VIT == "315M" ]]; then
-        ## Aurora friendly (head count is divisible by 12 and by 24)
+        ## 12 heads (head_dim 128) is the ALCF-4 model. Head count sets the
+        ## attention math, so it is part of the algorithm vendors must keep;
+        ## how they parallelize it is not.
         ##
-        ## 24, not 12, because Ulysses shards attention heads across the
-        ## sequence-parallel group and vit_backbone.py asserts
-        ## num_attention_heads % sp == 0. The ALCF-4 sweep's longest point
-        ## (1.73M tokens) runs at SP=24 -- two Aurora nodes -- which 12 heads
-        ## cannot satisfy, so that point failed at model construction on any
-        ## node count.
-        ##
-        ## This does not change the model's size or its measured work. The
-        ## QKV/output projections are hidden x hidden and the MLP is
-        ## hidden x ffn_hidden; head count appears in neither, so 12 -> 24
-        ## reshapes the same 308,281,344 parameters (head_dim 128 -> 64, the
-        ## more conventional value). num_floating_point_operations() in
-        ## megatron/training.py likewise takes no head term, so the FOM is
-        ## unchanged. Vendors must use 24 to reproduce these numbers.
+        ## VIT_HEADS overrides it, for one reason: Ulysses sequence
+        ## parallelism shards heads across the SP group and vit_backbone.py
+        ## asserts num_attention_heads % sp == 0, so SP=24 cannot run 12
+        ## heads. Neither the 308,281,344 parameters nor the FOM formula in
+        ## megatron/training.py has a head term, but measured time does:
+        ## FlashAttention on PVC is ~1.7x slower at head_dim 64 than at 128
+        ## (factor=32, one node: 64.5 vs 37.6 TFLOPS/tile). A 24-head run is
+        ## a different model and must not be reported as this one.
         NLAYERS=14
         HSIZE=1536
         FFN_HSIZE=4096
-        NUM_HEADS=24
+        NUM_HEADS="${VIT_HEADS:-12}"
     elif [[ $VIT == "HUGE" ]]; then
         ## VIT-HUGE (632M)
         NLAYERS=32
@@ -451,7 +447,7 @@ EOF
         --eval-iters 0  
     "
     OUTPUT_ARGS="
-        --log-interval 5 \
+        --log-interval ${LOG_INTERVAL:-5} \
         --eval-interval $EVAL_INTERVAL \
         --wandb-project $WANDB_PROJECT_NAME \
         --save-interval 2500 \
